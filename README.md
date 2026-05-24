@@ -7,6 +7,7 @@ Protein Interaction Analyzer is a PyMOL plugin for quick inspection and comparis
 ## Features
 
 - Interface residue detection based on dASA
+- Common PTM residues are included in the main interface workflow, not only in the PTM-specific command
 - Whole interaction area and total buried area
 - Residue-level local interface area hot spots
 - Hydrogen bond detection

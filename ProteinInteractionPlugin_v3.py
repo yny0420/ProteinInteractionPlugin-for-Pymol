@@ -32,9 +32,10 @@ from pymol import cmd, stored
 
 PLUGIN = "Protein Interaction Analyzer"
 
-ACIDIC_ATOMS = "(resn ASP+GLU and name OD1+OD2+OE1+OE2)"
+PTM_PHOSPHO_ATOMS = "(resn SEP+TPO+PTR+PHD and name O1P+O2P+O3P+OP1+OP2+OP3)"
+ACIDIC_ATOMS = "((resn ASP+GLU and name OD1+OD2+OE1+OE2) or %s)" % PTM_PHOSPHO_ATOMS
 BASIC_ATOMS = "(resn ARG+LYS+HIS+HID+HIE+HIP and name NZ+NH1+NH2+NE+ND1+NE2)"
-POLAR_ATOMS = "(donors or acceptors)"
+POLAR_ATOMS = "((donors or acceptors) or (resn SEP+TPO+PTR+PHD+ALY+MLY+M3L+MLZ+M2L+HYP+CSO+CME+KCX and elem N+O+S))"
 HYDROPHOBIC_ATOMS = "(resn ALA+VAL+LEU+ILE+MET+PHE+TYR+TRP+PRO and elem C+S and not name C+CA)"
 HEAVY_ATOMS = "(not hydro)"
 
@@ -79,6 +80,8 @@ PTM_GROUPS = {
 }
 
 PTM_RESN = tuple(sorted(set(itertools.chain.from_iterable(PTM_GROUPS.values()))))
+PTM_SELECTION = "(resn %s)" % "+".join(PTM_RESN)
+PROTEIN_OR_PTM = "(polymer.protein or %s)" % PTM_SELECTION
 
 PTM_LABELS = {
     "SEP": "pS",
@@ -99,7 +102,8 @@ PTM_LABELS = {
 
 
 def _aa1(resn):
-    return AA3_TO_1.get(str(resn).upper(), str(resn)[:1])
+    resn = str(resn).upper()
+    return PTM_LABELS.get(resn, AA3_TO_1.get(resn, resn[:1]))
 
 
 def _ptm_label(resn, chain, resi):
@@ -416,8 +420,8 @@ def calculate_interface_dasa(complex_obj, chain_a, chain_b, cutoff=1.0, prefix="
         cmd.set("solvent_radius", 1.4)
 
         cmd.create(tmp_complex, complex_sel)
-        cmd.remove("%s and not (polymer.protein and ((%s) or (%s)))" %
-                   (tmp_complex, sel_a, sel_b))
+        cmd.remove("%s and not (%s and ((%s) or (%s)))" %
+                   (tmp_complex, PROTEIN_OR_PTM, sel_a, sel_b))
 
         cmd.get_area(tmp_complex, load_b=1)
         cmd.alter(tmp_complex, "q=b")
@@ -499,8 +503,8 @@ def _closest_pairs(atoms_a, atoms_b, cutoff, by_residue=False):
 
 def find_hbonds(complex_obj, chain_a, chain_b, cutoff=3.6, angle=45):
     complex_sel = _model_selection(complex_obj)
-    sel_a = "(%s and (%s) and %s)" % (complex_sel, _chain_selection(chain_a), POLAR_ATOMS)
-    sel_b = "(%s and (%s) and %s)" % (complex_sel, _chain_selection(chain_b), POLAR_ATOMS)
+    sel_a = "(%s and (%s) and %s and %s)" % (complex_sel, _chain_selection(chain_a), PROTEIN_OR_PTM, POLAR_ATOMS)
+    sel_b = "(%s and (%s) and %s and %s)" % (complex_sel, _chain_selection(chain_b), PROTEIN_OR_PTM, POLAR_ATOMS)
     pairs = cmd.find_pairs(sel_a, sel_b, mode=1, cutoff=float(cutoff), angle=float(angle))
     contacts = []
     for left, right in pairs:
@@ -519,10 +523,10 @@ def find_hbonds(complex_obj, chain_a, chain_b, cutoff=3.6, angle=45):
 
 def find_salt_bridges(complex_obj, chain_a, chain_b, cutoff=4.0):
     complex_sel = _model_selection(complex_obj)
-    acid_a = _atoms("(%s and (%s) and %s)" % (complex_sel, _chain_selection(chain_a), ACIDIC_ATOMS))
-    base_a = _atoms("(%s and (%s) and %s)" % (complex_sel, _chain_selection(chain_a), BASIC_ATOMS))
-    acid_b = _atoms("(%s and (%s) and %s)" % (complex_sel, _chain_selection(chain_b), ACIDIC_ATOMS))
-    base_b = _atoms("(%s and (%s) and %s)" % (complex_sel, _chain_selection(chain_b), BASIC_ATOMS))
+    acid_a = _atoms("(%s and (%s) and %s and %s)" % (complex_sel, _chain_selection(chain_a), PROTEIN_OR_PTM, ACIDIC_ATOMS))
+    base_a = _atoms("(%s and (%s) and %s and %s)" % (complex_sel, _chain_selection(chain_a), PROTEIN_OR_PTM, BASIC_ATOMS))
+    acid_b = _atoms("(%s and (%s) and %s and %s)" % (complex_sel, _chain_selection(chain_b), PROTEIN_OR_PTM, ACIDIC_ATOMS))
+    base_b = _atoms("(%s and (%s) and %s and %s)" % (complex_sel, _chain_selection(chain_b), PROTEIN_OR_PTM, BASIC_ATOMS))
     contacts = _closest_pairs(acid_a, base_b, cutoff, True)
     contacts.extend(_closest_pairs(base_a, acid_b, cutoff, True))
     return sorted(contacts, key=lambda x: x["distance"])
@@ -530,15 +534,15 @@ def find_salt_bridges(complex_obj, chain_a, chain_b, cutoff=4.0):
 
 def find_hydrophobic_contacts(complex_obj, chain_a, chain_b, cutoff=4.2):
     complex_sel = _model_selection(complex_obj)
-    atoms_a = _atoms("(%s and (%s) and %s)" % (complex_sel, _chain_selection(chain_a), HYDROPHOBIC_ATOMS))
-    atoms_b = _atoms("(%s and (%s) and %s)" % (complex_sel, _chain_selection(chain_b), HYDROPHOBIC_ATOMS))
+    atoms_a = _atoms("(%s and (%s) and %s and %s)" % (complex_sel, _chain_selection(chain_a), PROTEIN_OR_PTM, HYDROPHOBIC_ATOMS))
+    atoms_b = _atoms("(%s and (%s) and %s and %s)" % (complex_sel, _chain_selection(chain_b), PROTEIN_OR_PTM, HYDROPHOBIC_ATOMS))
     return _closest_pairs(atoms_a, atoms_b, cutoff, True)
 
 
 def find_close_contacts(complex_obj, chain_a, chain_b, cutoff=2.2):
     complex_sel = _model_selection(complex_obj)
-    atoms_a = _atoms("(%s and (%s) and %s)" % (complex_sel, _chain_selection(chain_a), HEAVY_ATOMS))
-    atoms_b = _atoms("(%s and (%s) and %s)" % (complex_sel, _chain_selection(chain_b), HEAVY_ATOMS))
+    atoms_a = _atoms("(%s and (%s) and %s and %s)" % (complex_sel, _chain_selection(chain_a), PROTEIN_OR_PTM, HEAVY_ATOMS))
+    atoms_b = _atoms("(%s and (%s) and %s and %s)" % (complex_sel, _chain_selection(chain_b), PROTEIN_OR_PTM, HEAVY_ATOMS))
     return _closest_pairs(atoms_a, atoms_b, cutoff, False)
 
 
@@ -613,8 +617,8 @@ def make_visual_objects(complex_obj, chain_a, chain_b, interface, contacts, pref
     chain_a_sel = _safe_name(prefix + "chain" + str(chain_a))
     chain_b_sel = _safe_name(prefix + "chain" + str(chain_b))
 
-    cmd.select(chain_a_sel, "%s and (%s)" % (complex_sel, _chain_selection(chain_a)))
-    cmd.select(chain_b_sel, "%s and (%s)" % (complex_sel, _chain_selection(chain_b)))
+    cmd.select(chain_a_sel, "%s and (%s) and %s" % (complex_sel, _chain_selection(chain_a), PROTEIN_OR_PTM))
+    cmd.select(chain_b_sel, "%s and (%s) and %s" % (complex_sel, _chain_selection(chain_b), PROTEIN_OR_PTM))
 
     cmd.show("cartoon", _selref(chain_a_sel))
     cmd.show("cartoon", _selref(chain_b_sel))
@@ -1094,9 +1098,15 @@ def _region_query_contact_predicate(kind):
         return lambda a, b: _atom_element(a) in ("N", "O", "S") and _atom_element(b) in ("N", "O", "S")
     if kind == "salt_bridges":
         def is_salt(a, b):
-            acid_a = a.resn in ("ASP", "GLU") and a.name in ("OD1", "OD2", "OE1", "OE2")
+            acid_a = (
+                (a.resn in ("ASP", "GLU") and a.name in ("OD1", "OD2", "OE1", "OE2")) or
+                (a.resn in ("SEP", "TPO", "PTR", "PHD") and a.name in ("O1P", "O2P", "O3P", "OP1", "OP2", "OP3"))
+            )
             base_a = a.resn in ("ARG", "LYS", "HIS", "HID", "HIE", "HIP") and a.name in ("NZ", "NH1", "NH2", "NE", "ND1", "NE2")
-            acid_b = b.resn in ("ASP", "GLU") and b.name in ("OD1", "OD2", "OE1", "OE2")
+            acid_b = (
+                (b.resn in ("ASP", "GLU") and b.name in ("OD1", "OD2", "OE1", "OE2")) or
+                (b.resn in ("SEP", "TPO", "PTR", "PHD") and b.name in ("O1P", "O2P", "O3P", "OP1", "OP2", "OP3"))
+            )
             base_b = b.resn in ("ARG", "LYS", "HIS", "HID", "HIE", "HIP") and b.name in ("NZ", "NH1", "NH2", "NE", "ND1", "NE2")
             return (acid_a and base_b) or (base_a and acid_b)
         return is_salt
@@ -1279,9 +1289,9 @@ def ppi_region(spec="", target="", prefix="PPIregion", visualize=1,
     visualize = options.get("visualize", visualize)
 
     query_expr = _selection_expression(query)
-    target_expr = _selection_expression(target) if target else "(polymer.protein and not %s)" % query_expr
-    query_atoms = _atoms("(%s) and polymer.protein and not hydro" % query_expr)
-    target_atoms = _atoms("(%s) and polymer.protein and not hydro" % target_expr)
+    target_expr = _selection_expression(target) if target else "(%s and not %s)" % (PROTEIN_OR_PTM, query_expr)
+    query_atoms = _atoms("(%s) and %s and not hydro" % (query_expr, PROTEIN_OR_PTM))
+    target_atoms = _atoms("(%s) and %s and not hydro" % (target_expr, PROTEIN_OR_PTM))
     if not query_atoms:
         raise ValueError("Query selection has no protein heavy atoms: %s" % query)
     if not target_atoms:
@@ -1388,10 +1398,10 @@ def ppi_ptm(spec="", target="", prefix="PPIptm", visualize=1,
     else:
         obj = options.get("object", options.get("model", options.get("obj", "")))
         base = "(model %s)" % obj if obj else "(all)"
-        target_expr = "(%s and polymer.protein and not %s)" % (base, query_expr)
+        target_expr = "(%s and %s and not %s)" % (base, PROTEIN_OR_PTM, query_expr)
 
     query_atoms = _atoms("(%s) and not hydro" % query_expr)
-    target_atoms = _atoms("(%s) and polymer.protein and not hydro" % target_expr)
+    target_atoms = _atoms("(%s) and %s and not hydro" % (target_expr, PROTEIN_OR_PTM))
     if not query_atoms:
         raise ValueError("No known PTM atoms were found. Try ppi_ptm \"object=name; ptm=SEP+TPO+PTR\" or use query=your_selection.")
     if not target_atoms:
