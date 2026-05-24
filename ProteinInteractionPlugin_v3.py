@@ -11,6 +11,7 @@ Commands:
     ppi_analyze 1brs, A+B
     ppi_analyze 1brs, A+B+C+D
     ppi_batch "obj1:A+B;obj2:C+D"
+    ppi_region my_region
     ppi_fetch 1brs
 
 The dASA interface calculation is adapted from the user's
@@ -45,6 +46,8 @@ COLORS = {
     "salt": "magenta",
     "hydrophobic": "yellow",
     "clash": "red",
+    "region_query": "purple",
+    "region_hit": "lime",
 }
 
 
@@ -166,6 +169,42 @@ def _parse_batch_specs(specs):
     return parsed
 
 
+def _parse_region_spec(spec):
+    text = _strip_quotes(spec)
+    if not text:
+        raise ValueError("Please provide a query selection, e.g. ppi_region my_region")
+    options = {}
+    if ";" in text or "query=" in text or "target=" in text:
+        for part in [p.strip() for p in text.split(";") if p.strip()]:
+            if "=" in part:
+                key, value = [_strip_quotes(x) for x in part.split("=", 1)]
+                options[key.lower()] = value
+            elif "query" not in options:
+                options["query"] = part
+    else:
+        options["query"] = text
+    if "query" not in options:
+        raise ValueError("Region spec needs query=... or a named selection")
+    return options
+
+
+def _selection_expression(selection):
+    text = _strip_quotes(selection)
+    try:
+        if text in cmd.get_names("selections"):
+            return _selref(text)
+    except Exception:
+        pass
+    try:
+        if text in cmd.get_names("objects"):
+            return "(model %s)" % text
+    except Exception:
+        pass
+    if text.startswith("(") and text.endswith(")"):
+        return text
+    return "(%s)" % text
+
+
 def _float_option(options, key, current):
     if key not in options:
         return current
@@ -199,6 +238,18 @@ def _atom_sel(atom):
     return "(index %d)" % atom.index
 
 
+def _atom_model_key(atom):
+    return getattr(atom, "model", None) or getattr(atom, "_ppi_model", "")
+
+
+def _atom_element(atom):
+    elem = getattr(atom, "symbol", None) or getattr(atom, "elem", None)
+    if elem:
+        return str(elem).upper()
+    name = str(getattr(atom, "name", "")).strip()
+    return name[:1].upper() if name else ""
+
+
 def _atom_label(atom):
     return "%s:%s%s.%s" % (atom.chain or "-", atom.resn, atom.resi, atom.name)
 
@@ -216,6 +267,12 @@ def _selection_model_name(selection):
     for name in names:
         if re.search(r"(^|[^A-Za-z0-9_])%s([^A-Za-z0-9_]|$)" % re.escape(name), text):
             return name
+    try:
+        objects = cmd.get_object_list(selection)
+        if len(objects) == 1:
+            return objects[0]
+    except Exception:
+        pass
     return None
 
 
@@ -355,7 +412,7 @@ def _closest_pairs(atoms_a, atoms_b, cutoff, by_residue=False):
                     key = (atom_a.chain, atom_a.resi, atom_a.resn,
                            atom_b.chain, atom_b.resi, atom_b.resn)
                 else:
-                    key = (atom_a.model, atom_a.index, atom_b.model, atom_b.index)
+                    key = (_atom_model_key(atom_a), atom_a.index, _atom_model_key(atom_b), atom_b.index)
                 old = hits.get(key)
                 if old is None or distance < old["distance"]:
                     hits[key] = {
@@ -958,6 +1015,201 @@ def ppi_batch(specs="", cutoff=1.0, prefix="PPI", visualize=1,
     return {"jobs": jobs, "summary_rows": rows, "results": results, "table": table}
 
 
+def _region_query_contact_predicate(kind):
+    if kind == "hbonds":
+        return lambda a, b: _atom_element(a) in ("N", "O", "S") and _atom_element(b) in ("N", "O", "S")
+    if kind == "salt_bridges":
+        def is_salt(a, b):
+            acid_a = a.resn in ("ASP", "GLU") and a.name in ("OD1", "OD2", "OE1", "OE2")
+            base_a = a.resn in ("ARG", "LYS", "HIS", "HID", "HIE", "HIP") and a.name in ("NZ", "NH1", "NH2", "NE", "ND1", "NE2")
+            acid_b = b.resn in ("ASP", "GLU") and b.name in ("OD1", "OD2", "OE1", "OE2")
+            base_b = b.resn in ("ARG", "LYS", "HIS", "HID", "HIE", "HIP") and b.name in ("NZ", "NH1", "NH2", "NE", "ND1", "NE2")
+            return (acid_a and base_b) or (base_a and acid_b)
+        return is_salt
+    if kind == "hydrophobic":
+        hydrophobic_res = ("ALA", "VAL", "LEU", "ILE", "MET", "PHE", "TYR", "TRP", "PRO")
+        return lambda a, b: (
+            a.resn in hydrophobic_res and b.resn in hydrophobic_res and
+            _atom_element(a) in ("C", "S") and _atom_element(b) in ("C", "S") and
+            a.name not in ("C", "CA") and b.name not in ("C", "CA")
+        )
+    return lambda a, b: True
+
+
+def _filtered_pairs(query_atoms, target_atoms, cutoff, kind, by_residue=False):
+    pred = _region_query_contact_predicate(kind)
+    cutoff = float(cutoff)
+    hits = {}
+    for qa in query_atoms:
+        for ta in target_atoms:
+            if qa.index == ta.index and _atom_model_key(qa) == _atom_model_key(ta):
+                continue
+            if not pred(qa, ta):
+                continue
+            distance = _dist(qa.coord, ta.coord)
+            if distance <= cutoff:
+                if by_residue:
+                    key = (_atom_model_key(qa), qa.chain, qa.resi, qa.resn,
+                           _atom_model_key(ta), ta.chain, ta.resi, ta.resn)
+                else:
+                    key = (_atom_model_key(qa), qa.index, _atom_model_key(ta), ta.index)
+                old = hits.get(key)
+                if old is None or distance < old["distance"]:
+                    hits[key] = {"atom_a": qa, "atom_b": ta, "distance": distance}
+    return sorted(hits.values(), key=lambda x: x["distance"])
+
+
+def _region_contacts(query_atoms, target_atoms, hbond_cutoff=3.6, salt_cutoff=4.0,
+                     hydrophobic_cutoff=4.2, contact_cutoff=4.0, clash_cutoff=2.2):
+    return {
+        "hbonds": _filtered_pairs(query_atoms, target_atoms, hbond_cutoff, "hbonds", False),
+        "salt_bridges": _filtered_pairs(query_atoms, target_atoms, salt_cutoff, "salt_bridges", True),
+        "hydrophobic": _filtered_pairs(query_atoms, target_atoms, hydrophobic_cutoff, "hydrophobic", True),
+        "contacts": _filtered_pairs(query_atoms, target_atoms, contact_cutoff, "contacts", True),
+        "clashes": _filtered_pairs(query_atoms, target_atoms, clash_cutoff, "clashes", False),
+    }
+
+
+def _hit_residue_selection_from_contacts(contacts, prefix):
+    hit_sel = _safe_name(prefix + "hits")
+    cmd.select(hit_sel, "none")
+    seen = set()
+    for contact_list in contacts.values():
+        for contact in contact_list:
+            atom = contact["atom_b"]
+            key = (_atom_model_key(atom), atom.chain, atom.resi)
+            if key in seen:
+                continue
+            seen.add(key)
+            model_part = "model %s and " % _atom_model_key(atom) if _atom_model_key(atom) else ""
+            cmd.select(hit_sel, "%s or (%schain %s and resi %s)" % (hit_sel, model_part, atom.chain, atom.resi))
+    return hit_sel, seen
+
+
+def _format_region_rows(contacts):
+    rows = []
+    names = [
+        ("H-bond", "hbonds"),
+        ("Salt bridge", "salt_bridges"),
+        ("Hydrophobic", "hydrophobic"),
+        ("Contact", "contacts"),
+        ("Close contact", "clashes"),
+    ]
+    for label, key in names:
+        for contact in contacts[key]:
+            rows.append({
+                "type": label,
+                "query_residue": "%s:%s%s" % (contact["atom_a"].chain, contact["atom_a"].resn, contact["atom_a"].resi),
+                "hit_residue": "%s:%s%s" % (contact["atom_b"].chain, contact["atom_b"].resn, contact["atom_b"].resi),
+                "query_atom": _atom_label(contact["atom_a"]),
+                "hit_atom": _atom_label(contact["atom_b"]),
+                "distance": contact["distance"],
+            })
+    return rows
+
+
+def _build_region_table(query_name, target_expr, contacts, hit_count):
+    rows = _format_region_rows(contacts)
+    lines = []
+    lines.append("[%s] Region interaction search" % PLUGIN)
+    lines.append("Query: %s" % query_name)
+    lines.append("Target: %s" % target_expr)
+    lines.append("Hit residues: %d" % hit_count)
+    lines.append("H-bonds: %d | Salt bridges: %d | Hydrophobic: %d | Contacts: %d | Close contacts: %d" % (
+        len(contacts["hbonds"]), len(contacts["salt_bridges"]), len(contacts["hydrophobic"]),
+        len(contacts["contacts"]), len(contacts["clashes"])))
+    lines.append("")
+    lines.append("%-14s %-12s %-12s %8s  %s" % ("Type", "Query", "Hit", "Dist(A)", "Atoms"))
+    lines.append("-" * 92)
+    for row in rows[:300]:
+        lines.append("%-14s %-12s %-12s %8.2f  %s -- %s" % (
+            row["type"], row["query_residue"], row["hit_residue"], row["distance"],
+            row["query_atom"], row["hit_atom"]))
+    if len(rows) > 300:
+        lines.append("... %d more rows omitted; use export_path to save all rows." % (len(rows) - 300))
+    return "\n".join(lines), rows
+
+
+def _export_region_csv(path, query_name, target_expr, rows):
+    with open(path, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["query", query_name])
+        writer.writerow(["target", target_expr])
+        writer.writerow([])
+        writer.writerow(["type", "query_residue", "hit_residue", "query_atom", "hit_atom", "distance_A"])
+        for row in rows:
+            writer.writerow([row["type"], row["query_residue"], row["hit_residue"],
+                             row["query_atom"], row["hit_atom"], "%.2f" % row["distance"]])
+
+
+def ppi_region(spec="", target="", prefix="PPIregion", visualize=1,
+               hbond_cutoff=3.6, salt_cutoff=4.0, hydrophobic_cutoff=4.2,
+               contact_cutoff=4.0, clash_cutoff=2.2, export_path=""):
+    """Find all residues interacting with a user-selected region.
+
+    Recommended usage:
+        select my_region, 1brs and chain A and resi 185-205
+        ppi_region my_region
+
+    Or:
+        ppi_region "query=my_region; target=1brs and chain B"
+    """
+    options = _parse_region_spec(spec)
+    query = options.get("query")
+    target = options.get("target", target)
+    prefix = options.get("prefix", prefix)
+    export_path = options.get("export_path", export_path)
+    hbond_cutoff = float(options.get("hbond_cutoff", hbond_cutoff))
+    salt_cutoff = float(options.get("salt_cutoff", salt_cutoff))
+    hydrophobic_cutoff = float(options.get("hydrophobic_cutoff", hydrophobic_cutoff))
+    contact_cutoff = float(options.get("contact_cutoff", contact_cutoff))
+    clash_cutoff = float(options.get("clash_cutoff", clash_cutoff))
+    visualize = options.get("visualize", visualize)
+
+    query_expr = _selection_expression(query)
+    target_expr = _selection_expression(target) if target else "(polymer.protein and not %s)" % query_expr
+    query_atoms = _atoms("(%s) and polymer.protein and not hydro" % query_expr)
+    target_atoms = _atoms("(%s) and polymer.protein and not hydro" % target_expr)
+    if not query_atoms:
+        raise ValueError("Query selection has no protein heavy atoms: %s" % query)
+    if not target_atoms:
+        raise ValueError("Target selection has no protein heavy atoms: %s" % target_expr)
+
+    contacts = _region_contacts(query_atoms, target_atoms, hbond_cutoff, salt_cutoff,
+                                hydrophobic_cutoff, contact_cutoff, clash_cutoff)
+    prefix = _safe_name(prefix)
+    query_sel = _safe_name(prefix + "query")
+    cmd.select(query_sel, query_expr)
+    hit_sel, hit_residues = _hit_residue_selection_from_contacts(contacts, prefix)
+
+    if _as_bool(visualize):
+        cmd.show("sticks", _selref(query_sel))
+        cmd.color(COLORS["region_query"], _selref(query_sel))
+        cmd.show("sticks", _selref(hit_sel))
+        cmd.color(COLORS["region_hit"], _selref(hit_sel))
+        cmd.util.cnc(_selref(query_sel))
+        cmd.util.cnc(_selref(hit_sel))
+        cmd.label("%s and name CA" % _selref(hit_sel), '"%s:%s%s" % (chain, _aa1(resn), resi)')
+        cmd.show("labels", "%s and name CA" % _selref(hit_sel))
+        cmd.set("label_color", "white", hit_sel)
+        cmd.set("label_size", 18, hit_sel)
+        cmd.set("label_outline_color", "black", hit_sel)
+        _distance_object(prefix + "hbonds", contacts["hbonds"], COLORS["hbond"], 160)
+        _distance_object(prefix + "salt", contacts["salt_bridges"], COLORS["salt"], 160)
+        _distance_object(prefix + "hydrophobic", contacts["hydrophobic"], COLORS["hydrophobic"], 100)
+        _distance_object(prefix + "contacts", contacts["contacts"], "gray70", 160)
+        _distance_object(prefix + "clashes", contacts["clashes"], COLORS["clash"], 100)
+        cmd.zoom("%s or %s" % (_selref(query_sel), _selref(hit_sel)), 8)
+
+    table, rows = _build_region_table(query, target_expr, contacts, len(hit_residues))
+    if export_path:
+        _export_region_csv(os.path.expanduser(export_path), query, target_expr, rows)
+        print("[%s] Region CSV exported: %s" % (PLUGIN, os.path.expanduser(export_path)))
+    print(table)
+    return {"query_selection": query_sel, "hit_selection": hit_sel,
+            "contacts": contacts, "rows": rows, "table": table}
+
+
 def ppi_score_help():
     text = """
 [Protein Interaction Analyzer] How to compare interface strength
@@ -1186,6 +1438,8 @@ def ppi_panel():
         print("  ppi_analyze 1brs, A+B")
         print("  ppi_analyze 1brs, A+B+C+D")
         print('  ppi_batch "001:A+B;002:A+B;003:C+D"')
+        print("  select my_region, 1brs and chain A and resi 185-205")
+        print("  ppi_region my_region")
         return None
     parent = None
     try:
@@ -1202,6 +1456,7 @@ def __init_plugin__(app=None):
     cmd.extend("ppi_load", ppi_load)
     cmd.extend("ppi_analyze", ppi_analyze)
     cmd.extend("ppi_batch", ppi_batch)
+    cmd.extend("ppi_region", ppi_region)
     cmd.extend("ppi_score_help", ppi_score_help)
     try:
         app.menuBar.addmenuitem("Plugin", "command", PLUGIN, label=PLUGIN, command=ppi_panel)
@@ -1214,4 +1469,5 @@ cmd.extend("ppi_fetch", ppi_fetch)
 cmd.extend("ppi_load", ppi_load)
 cmd.extend("ppi_analyze", ppi_analyze)
 cmd.extend("ppi_batch", ppi_batch)
+cmd.extend("ppi_region", ppi_region)
 cmd.extend("ppi_score_help", ppi_score_help)

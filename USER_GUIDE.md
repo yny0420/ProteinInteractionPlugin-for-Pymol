@@ -251,6 +251,49 @@ ppi_batch "001:A+B;002:A+B;003:C+D", summary_csv=/tmp/batch_summary.csv
 ppi_batch "001:A+B;002:A+B", export_dir=/tmp/ppi_details
 ```
 
+## 9.5 分析自定义区域周围的互作位点
+
+如果你想选中某个 loop、口袋、motif、突变位点或一段残基，然后查看其它任何与该区域互作的位点，可以使用 `ppi_region`。
+
+推荐先创建一个 PyMOL selection：
+
+```pymol
+select my_region, 1brs and chain A and resi 35-45
+```
+
+然后运行：
+
+```pymol
+ppi_region my_region
+```
+
+插件会自动搜索 `my_region` 之外所有与它接触的蛋白残基，并显示：
+
+- 氢键
+- 盐桥/离子相互作用
+- 疏水接触
+- 一般接触
+- close contact / clash
+
+也可以显式指定搜索范围：
+
+```pymol
+ppi_region "query=my_region; target=1brs and chain D"
+```
+
+导出 CSV：
+
+```pymol
+ppi_region "query=my_region; target=1brs and chain D; export_path=/tmp/region_contacts.csv"
+```
+
+常见用途：
+
+- 查看某个突变位点周围所有互作残基
+- 查看某个结构域、loop 或 motif 与其它链的接触
+- 查看小范围界面附近是否有氢键、盐桥或疏水接触
+- 从一个功能区域出发寻找潜在互作热点
+
 ## 10. PyMOL 中生成的结果
 
 以命令为例：
