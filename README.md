@@ -17,6 +17,7 @@ Protein Interaction Analyzer is a PyMOL plugin for quick inspection and comparis
 - Pairwise analysis among multiple chains in one structure
 - Batch comparison across multiple loaded PyMOL objects
 - Region-based interaction search from any user-defined selection
+- PTM-site interaction search for common modified residues such as SEP/TPO/PTR
 - CSV export
 
 ## Recommended Plugin File
@@ -64,6 +65,13 @@ Search interactions around a selected region:
 ```pymol
 select my_region, 1brs and chain A and resi 35-45
 ppi_region my_region
+```
+
+Search interactions around PTM sites:
+
+```pymol
+ppi_ptm 7mp9
+ppi_ptm "object=7mp9; ptm=phospho"
 ```
 
 ## Documentation

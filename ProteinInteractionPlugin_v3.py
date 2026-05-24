@@ -12,6 +12,7 @@ Commands:
     ppi_analyze 1brs, A+B+C+D
     ppi_batch "obj1:A+B;obj2:C+D"
     ppi_region my_region
+    ppi_ptm 7mp9
     ppi_fetch 1brs
 
 The dASA interface calculation is adapted from the user's
@@ -48,6 +49,8 @@ COLORS = {
     "clash": "red",
     "region_query": "purple",
     "region_hit": "lime",
+    "ptm_site": "hotpink",
+    "ptm_hit": "lime",
 }
 
 
@@ -57,11 +60,51 @@ AA3_TO_1 = {
     "HIE": "H", "HIP": "H", "ILE": "I", "LEU": "L", "LYS": "K",
     "MET": "M", "MSE": "M", "PHE": "F", "PRO": "P", "SER": "S",
     "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+    "SEP": "S", "TPO": "T", "PTR": "Y", "PHD": "H", "HYP": "P",
+    "ALY": "K", "MLY": "K", "M3L": "K", "MLZ": "K", "M2L": "K",
+    "CSO": "C", "CME": "C", "KCX": "K",
+}
+
+
+PTM_GROUPS = {
+    "phospho": ("SEP", "TPO", "PTR", "PHD"),
+    "phosphorylation": ("SEP", "TPO", "PTR", "PHD"),
+    "acetyl": ("ALY",),
+    "acetylation": ("ALY",),
+    "methyl": ("MLY", "M3L", "MLZ", "M2L", "CME"),
+    "methylation": ("MLY", "M3L", "MLZ", "M2L", "CME"),
+    "hydroxy": ("HYP", "CSO"),
+    "hydroxylation": ("HYP", "CSO"),
+    "carboxylation": ("KCX",),
+}
+
+PTM_RESN = tuple(sorted(set(itertools.chain.from_iterable(PTM_GROUPS.values()))))
+
+PTM_LABELS = {
+    "SEP": "pS",
+    "TPO": "pT",
+    "PTR": "pY",
+    "PHD": "pH",
+    "HIP": "pH",
+    "ALY": "acK",
+    "MLY": "meK",
+    "M3L": "me3K",
+    "MLZ": "meK",
+    "M2L": "me2K",
+    "CME": "meC",
+    "HYP": "hyP",
+    "CSO": "oxC",
+    "KCX": "cxK",
 }
 
 
 def _aa1(resn):
     return AA3_TO_1.get(str(resn).upper(), str(resn)[:1])
+
+
+def _ptm_label(resn, chain, resi):
+    label = PTM_LABELS.get(str(resn).upper(), str(resn).upper())
+    return "%s:%s%s" % (chain or "-", label, resi)
 
 
 def _safe_name(text, fallback="PPI"):
@@ -186,6 +229,37 @@ def _parse_region_spec(spec):
     if "query" not in options:
         raise ValueError("Region spec needs query=... or a named selection")
     return options
+
+
+def _parse_key_value_spec(spec, default_key):
+    text = _strip_quotes(spec)
+    options = {}
+    if not text:
+        return options
+    if ";" in text or "=" in text:
+        for part in [p.strip() for p in text.split(";") if p.strip()]:
+            if "=" in part:
+                key, value = [_strip_quotes(x) for x in part.split("=", 1)]
+                options[key.lower()] = value
+            elif default_key not in options:
+                options[default_key] = part
+    else:
+        options[default_key] = text
+    return options
+
+
+def _ptm_residue_names(ptm):
+    text = _strip_quotes(ptm or "all").lower()
+    if not text or text == "all":
+        return PTM_RESN
+    if text in PTM_GROUPS:
+        return PTM_GROUPS[text]
+    names = [x.strip().upper() for x in re.split(r"[,+:\s]+", text) if x.strip()]
+    return tuple(names) if names else PTM_RESN
+
+
+def _resn_selection(residue_names):
+    return "resn %s" % "+".join(str(x).upper() for x in residue_names)
 
 
 def _selection_expression(selection):
@@ -1059,6 +1133,44 @@ def _filtered_pairs(query_atoms, target_atoms, cutoff, kind, by_residue=False):
     return sorted(hits.values(), key=lambda x: x["distance"])
 
 
+def _resi_int(resi):
+    match = re.search(r"-?\d+", str(resi))
+    if not match:
+        return None
+    try:
+        return int(match.group(0))
+    except Exception:
+        return None
+
+
+def _exclude_sequence_neighbors(target_atoms, query_atoms, window):
+    window = int(window)
+    if window <= 0:
+        return target_atoms
+    query_residues = []
+    for atom in query_atoms:
+        resi_number = _resi_int(atom.resi)
+        if resi_number is None:
+            continue
+        query_residues.append((_atom_model_key(atom), atom.chain, resi_number))
+    if not query_residues:
+        return target_atoms
+    filtered = []
+    for atom in target_atoms:
+        atom_resi = _resi_int(atom.resi)
+        if atom_resi is None:
+            filtered.append(atom)
+            continue
+        skip = False
+        for model, chain, query_resi in query_residues:
+            if _atom_model_key(atom) == model and atom.chain == chain and abs(atom_resi - query_resi) <= window:
+                skip = True
+                break
+        if not skip:
+            filtered.append(atom)
+    return filtered
+
+
 def _region_contacts(query_atoms, target_atoms, hbond_cutoff=3.6, salt_cutoff=4.0,
                      hydrophobic_cutoff=4.2, contact_cutoff=4.0, clash_cutoff=2.2):
     return {
@@ -1207,6 +1319,130 @@ def ppi_region(spec="", target="", prefix="PPIregion", visualize=1,
         print("[%s] Region CSV exported: %s" % (PLUGIN, os.path.expanduser(export_path)))
     print(table)
     return {"query_selection": query_sel, "hit_selection": hit_sel,
+            "contacts": contacts, "rows": rows, "table": table}
+
+
+def _ptm_query_expression(options):
+    if options.get("query"):
+        return _selection_expression(options["query"]), options.get("query")
+    obj = options.get("object", options.get("model", options.get("obj", "")))
+    ptm = options.get("ptm", options.get("type", "all"))
+    chain = options.get("chain", "")
+    resi = options.get("resi", options.get("residue", ""))
+    residue_names = _ptm_residue_names(ptm)
+    parts = []
+    if obj:
+        parts.append("model %s" % obj)
+    parts.append(_resn_selection(residue_names))
+    if chain:
+        parts.append("chain %s" % chain)
+    if resi:
+        parts.append("resi %s" % resi)
+    query_expr = "(" + " and ".join(parts) + ")"
+    query_name = options.get("query", "PTM:%s" % "+".join(residue_names))
+    if obj:
+        query_name = "%s %s" % (obj, query_name)
+    return query_expr, query_name
+
+
+def _ptm_summary(query_atoms):
+    residues = {}
+    for atom in query_atoms:
+        key = (_atom_model_key(atom), atom.chain, atom.resi, atom.resn)
+        residues[key] = atom
+    rows = []
+    for key in sorted(residues, key=lambda x: (x[0], x[1], _resi_sort_key(x[2]), x[3])):
+        model, chain, resi, resn = key
+        rows.append("%s:%s" % (model or "-", _ptm_label(resn, chain, resi)))
+    return rows
+
+
+def ppi_ptm(spec="", target="", prefix="PPIptm", visualize=1,
+            hbond_cutoff=3.6, salt_cutoff=4.0, hydrophobic_cutoff=4.2,
+            contact_cutoff=4.0, clash_cutoff=2.2, export_path="", exclude_neighbors=1):
+    """Find protein sites interacting with PTM residues.
+
+    Examples:
+        ppi_ptm 7mp9
+        ppi_ptm "object=7mp9; ptm=phospho"
+        ppi_ptm "object=7mp9; chain=A; resi=205"
+        ppi_ptm "object=7mp9; exclude_neighbors=0"
+        select my_ptm, 7mp9 and chain A and resi 205
+        ppi_ptm "query=my_ptm"
+    """
+    options = _parse_key_value_spec(spec, "object")
+    target = options.get("target", target)
+    prefix = options.get("prefix", prefix)
+    export_path = options.get("export_path", export_path)
+    hbond_cutoff = float(options.get("hbond_cutoff", hbond_cutoff))
+    salt_cutoff = float(options.get("salt_cutoff", salt_cutoff))
+    hydrophobic_cutoff = float(options.get("hydrophobic_cutoff", hydrophobic_cutoff))
+    contact_cutoff = float(options.get("contact_cutoff", contact_cutoff))
+    clash_cutoff = float(options.get("clash_cutoff", clash_cutoff))
+    exclude_neighbors = int(options.get("exclude_neighbors", exclude_neighbors))
+    visualize = options.get("visualize", visualize)
+
+    query_expr, query_name = _ptm_query_expression(options)
+    if target:
+        target_expr = "(%s and not %s)" % (_selection_expression(target), query_expr)
+    else:
+        obj = options.get("object", options.get("model", options.get("obj", "")))
+        base = "(model %s)" % obj if obj else "(all)"
+        target_expr = "(%s and polymer.protein and not %s)" % (base, query_expr)
+
+    query_atoms = _atoms("(%s) and not hydro" % query_expr)
+    target_atoms = _atoms("(%s) and polymer.protein and not hydro" % target_expr)
+    if not query_atoms:
+        raise ValueError("No known PTM atoms were found. Try ppi_ptm \"object=name; ptm=SEP+TPO+PTR\" or use query=your_selection.")
+    if not target_atoms:
+        raise ValueError("Target selection has no protein heavy atoms: %s" % target_expr)
+    target_atoms = _exclude_sequence_neighbors(target_atoms, query_atoms, exclude_neighbors)
+    if not target_atoms:
+        raise ValueError("No target atoms remain after exclude_neighbors=%d." % exclude_neighbors)
+
+    contacts = _region_contacts(query_atoms, target_atoms, hbond_cutoff, salt_cutoff,
+                                hydrophobic_cutoff, contact_cutoff, clash_cutoff)
+    prefix = _safe_name(prefix)
+    ptm_sel = _safe_name(prefix + "sites")
+    cmd.select(ptm_sel, query_expr)
+    hit_sel, hit_residues = _hit_residue_selection_from_contacts(contacts, prefix)
+
+    if _as_bool(visualize):
+        cmd.show("sticks", _selref(ptm_sel))
+        cmd.show("spheres", "%s and elem P" % _selref(ptm_sel))
+        cmd.color(COLORS["ptm_site"], _selref(ptm_sel))
+        cmd.show("sticks", _selref(hit_sel))
+        cmd.color(COLORS["ptm_hit"], _selref(hit_sel))
+        cmd.util.cnc(_selref(ptm_sel))
+        cmd.util.cnc(_selref(hit_sel))
+        cmd.label("%s and name CA" % _selref(ptm_sel), '"%s" % _ptm_label(resn, chain, resi)')
+        cmd.label("%s and name CA" % _selref(hit_sel), '"%s:%s%s" % (chain, _aa1(resn), resi)')
+        cmd.show("labels", "%s or %s" % (
+            "%s and name CA" % _selref(ptm_sel),
+            "%s and name CA" % _selref(hit_sel),
+        ))
+        cmd.set("label_color", "white", ptm_sel)
+        cmd.set("label_color", "white", hit_sel)
+        cmd.set("label_size", 18, ptm_sel)
+        cmd.set("label_size", 18, hit_sel)
+        cmd.set("label_outline_color", "black", ptm_sel)
+        cmd.set("label_outline_color", "black", hit_sel)
+        _distance_object(prefix + "hbonds", contacts["hbonds"], COLORS["hbond"], 160)
+        _distance_object(prefix + "salt", contacts["salt_bridges"], COLORS["salt"], 160)
+        _distance_object(prefix + "hydrophobic", contacts["hydrophobic"], COLORS["hydrophobic"], 100)
+        _distance_object(prefix + "contacts", contacts["contacts"], "gray70", 160)
+        _distance_object(prefix + "clashes", contacts["clashes"], COLORS["clash"], 100)
+        cmd.zoom("%s or %s" % (_selref(ptm_sel), _selref(hit_sel)), 8)
+
+    table, rows = _build_region_table(query_name, target_expr, contacts, len(hit_residues))
+    ptm_rows = _ptm_summary(query_atoms)
+    table = table + "\nPTM sites: " + (", ".join(ptm_rows) if ptm_rows else "none")
+    table = table + "\nExcluded same-chain neighboring residues: +/- %d" % exclude_neighbors
+    if export_path:
+        _export_region_csv(os.path.expanduser(export_path), query_name, target_expr, rows)
+        print("[%s] PTM interaction CSV exported: %s" % (PLUGIN, os.path.expanduser(export_path)))
+    print(table)
+    return {"ptm_selection": ptm_sel, "hit_selection": hit_sel, "ptm_sites": ptm_rows,
             "contacts": contacts, "rows": rows, "table": table}
 
 
@@ -1440,6 +1676,7 @@ def ppi_panel():
         print('  ppi_batch "001:A+B;002:A+B;003:C+D"')
         print("  select my_region, 1brs and chain A and resi 185-205")
         print("  ppi_region my_region")
+        print("  ppi_ptm 7mp9")
         return None
     parent = None
     try:
@@ -1457,6 +1694,7 @@ def __init_plugin__(app=None):
     cmd.extend("ppi_analyze", ppi_analyze)
     cmd.extend("ppi_batch", ppi_batch)
     cmd.extend("ppi_region", ppi_region)
+    cmd.extend("ppi_ptm", ppi_ptm)
     cmd.extend("ppi_score_help", ppi_score_help)
     try:
         app.menuBar.addmenuitem("Plugin", "command", PLUGIN, label=PLUGIN, command=ppi_panel)
@@ -1470,4 +1708,5 @@ cmd.extend("ppi_load", ppi_load)
 cmd.extend("ppi_analyze", ppi_analyze)
 cmd.extend("ppi_batch", ppi_batch)
 cmd.extend("ppi_region", ppi_region)
+cmd.extend("ppi_ptm", ppi_ptm)
 cmd.extend("ppi_score_help", ppi_score_help)
