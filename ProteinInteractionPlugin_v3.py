@@ -13,6 +13,7 @@ Commands:
     ppi_batch "obj1:A+B;obj2:C+D"
     ppi_region my_region
     ppi_ptm 7mp9
+    ppi_ub 5bnb
     ppi_fetch 1brs
 
 The dASA interface calculation is adapted from the user's
@@ -34,8 +35,8 @@ PLUGIN = "Protein Interaction Analyzer"
 
 PTM_PHOSPHO_ATOMS = "(resn SEP+TPO+PTR+PHD and name O1P+O2P+O3P+OP1+OP2+OP3)"
 ACIDIC_ATOMS = "((resn ASP+GLU and name OD1+OD2+OE1+OE2) or %s)" % PTM_PHOSPHO_ATOMS
-BASIC_ATOMS = "(resn ARG+LYS+HIS+HID+HIE+HIP and name NZ+NH1+NH2+NE+ND1+NE2)"
-POLAR_ATOMS = "((donors or acceptors) or (resn SEP+TPO+PTR+PHD+ALY+MLY+M3L+MLZ+M2L+HYP+CSO+CME+KCX and elem N+O+S))"
+BASIC_ATOMS = "(resn ARG+LYS+SLZ+HIS+HID+HIE+HIP and name NZ+NH1+NH2+NE+ND1+NE2)"
+POLAR_ATOMS = "((donors or acceptors) or (resn SEP+TPO+PTR+PHD+ALY+MLY+M3L+MLZ+M2L+HYP+CSO+CME+KCX+SLZ and elem N+O+S))"
 HYDROPHOBIC_ATOMS = "(resn ALA+VAL+LEU+ILE+MET+PHE+TYR+TRP+PRO and elem C+S and not name C+CA)"
 HEAVY_ATOMS = "(not hydro)"
 
@@ -52,6 +53,9 @@ COLORS = {
     "region_hit": "lime",
     "ptm_site": "hotpink",
     "ptm_hit": "lime",
+    "ubiquitin": "tv_orange",
+    "ubiquitin_target": "lightblue",
+    "ubiquitin_linkage": "hotpink",
 }
 
 
@@ -63,7 +67,7 @@ AA3_TO_1 = {
     "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
     "SEP": "S", "TPO": "T", "PTR": "Y", "PHD": "H", "HYP": "P",
     "ALY": "K", "MLY": "K", "M3L": "K", "MLZ": "K", "M2L": "K",
-    "CSO": "C", "CME": "C", "KCX": "K",
+    "CSO": "C", "CME": "C", "KCX": "K", "SLZ": "K",
 }
 
 
@@ -77,6 +81,8 @@ PTM_GROUPS = {
     "hydroxy": ("HYP", "CSO"),
     "hydroxylation": ("HYP", "CSO"),
     "carboxylation": ("KCX",),
+    "ubiquitin": ("SLZ",),
+    "ubiquitination": ("SLZ",),
 }
 
 PTM_RESN = tuple(sorted(set(itertools.chain.from_iterable(PTM_GROUPS.values()))))
@@ -98,6 +104,7 @@ PTM_LABELS = {
     "HYP": "hyP",
     "CSO": "oxC",
     "KCX": "cxK",
+    "SLZ": "ubK",
 }
 
 
@@ -177,6 +184,13 @@ def _parse_chains(chains):
     if len(values) < 2:
         raise ValueError("Please provide at least two chains, for example A+B")
     return values
+
+
+def _parse_optional_chains(chains):
+    text = _strip_quotes(chains or "")
+    if not text:
+        return []
+    return [c.strip() for c in re.split(r"[,+;:\s]+", text) if c.strip()]
 
 
 def _parse_inline_command(first_arg, default_chains):
@@ -1456,6 +1470,246 @@ def ppi_ptm(spec="", target="", prefix="PPIptm", visualize=1,
             "contacts": contacts, "rows": rows, "table": table}
 
 
+def _chain_residue_sequence(complex_obj, chain):
+    atoms = _atoms("%s and (%s) and %s and name CA" % (
+        _model_selection(complex_obj), _chain_selection(chain), PROTEIN_OR_PTM))
+    residues = []
+    seen = set()
+    for atom in atoms:
+        key = (atom.chain, atom.resi, atom.resn)
+        if key in seen:
+            continue
+        seen.add(key)
+        residues.append({"chain": atom.chain, "resi": atom.resi, "resn": atom.resn})
+    residues.sort(key=lambda r: _resi_sort_key(r["resi"]))
+    sequence = "".join(AA3_TO_1.get(r["resn"], "X")[:1] for r in residues)
+    return residues, sequence
+
+
+def _ubiquitin_like_chains(complex_obj):
+    hits = []
+    for chain in cmd.get_chains(complex_obj):
+        residues, sequence = _chain_residue_sequence(complex_obj, chain)
+        length = len(residues)
+        tail = sequence[-10:]
+        if 65 <= length <= 90 and (
+            "LRGG" in tail or
+            sequence.startswith("MQIFVK") or
+            "TITLE" in sequence[:20]
+        ):
+            hits.append({"chain": chain, "length": length, "sequence": sequence})
+    return hits
+
+
+def _terminal_ubiquitin_gly_c(complex_obj, chain):
+    atoms = _atoms("%s and (%s) and resn GLY and name C" % (
+        _model_selection(complex_obj), _chain_selection(chain)))
+    if not atoms:
+        return None
+    atoms.sort(key=lambda atom: _resi_sort_key(atom.resi))
+    return atoms[-1]
+
+
+def _n_terminal_n_atoms(complex_obj, chain):
+    atoms = _atoms("%s and (%s) and %s and name N" % (
+        _model_selection(complex_obj), _chain_selection(chain), PROTEIN_OR_PTM))
+    first_by_residue = {}
+    for atom in atoms:
+        key = _resi_sort_key(atom.resi)
+        if key not in first_by_residue:
+            first_by_residue[key] = atom
+    if not first_by_residue:
+        return []
+    first_key = sorted(first_by_residue.keys())[0]
+    return [first_by_residue[first_key]]
+
+
+def _ubiquitin_linkages(complex_obj, ubiquitin_chains, target_chains, cutoff=2.4):
+    rows = []
+    contacts = []
+    for ub_chain in ubiquitin_chains:
+        gly_c = _terminal_ubiquitin_gly_c(complex_obj, ub_chain)
+        if gly_c is None:
+            continue
+        for target_chain in target_chains:
+            if target_chain == ub_chain:
+                continue
+            lys_atoms = _atoms("%s and (%s) and resn LYS+SLZ and name NZ" % (
+                _model_selection(complex_obj), _chain_selection(target_chain)))
+            nterm_atoms = _n_terminal_n_atoms(complex_obj, target_chain)
+            candidates = [("isopeptide Lys", atom) for atom in lys_atoms]
+            candidates.extend([("linear N-term", atom) for atom in nterm_atoms])
+            for link_type, atom in candidates:
+                distance = _dist(gly_c.coord, atom.coord)
+                if distance <= float(cutoff):
+                    row = {
+                        "type": link_type,
+                        "ub_chain": ub_chain,
+                        "ub_residue": "%s%s" % (gly_c.resn, gly_c.resi),
+                        "target_chain": target_chain,
+                        "target_residue": "%s%s" % (atom.resn, atom.resi),
+                        "target_atom": atom.name,
+                        "distance": distance,
+                        "detail": "%s -- %s" % (_atom_label(gly_c), _atom_label(atom)),
+                    }
+                    rows.append(row)
+                    contacts.append({"atom_a": gly_c, "atom_b": atom, "distance": distance})
+    rows.sort(key=lambda r: r["distance"])
+    return rows, contacts
+
+
+def _format_ubiquitin_summary(complex_obj, ub_chains, pair_rows, linkage_rows):
+    lines = []
+    lines.append("[%s] Ubiquitin interaction summary for %s" % (PLUGIN, complex_obj))
+    lines.append("Detected ubiquitin chains: %s" % (", ".join(ub_chains) if ub_chains else "none"))
+    lines.append("")
+    lines.append("%-8s %-8s %8s %10s %7s %6s %12s %8s %7s" %
+                 ("Ub", "Target", "Residues", "Area(A2)", "HBond", "Salt", "Hydrophobic", "Clash", "Score"))
+    lines.append("-" * 88)
+    for row in pair_rows:
+        lines.append("%-8s %-8s %8d %10.1f %7d %6d %12d %8d %7.1f" %
+                     (row["ub_chain"], row["target_chain"], row["interface_residues"],
+                      row["interface_area"], row["hbonds"], row["salt_bridges"],
+                      row["hydrophobic"], row["clashes"], row["score"]))
+    lines.append("")
+    lines.append("Likely ubiquitin covalent linkages")
+    if not linkage_rows:
+        lines.append("none found within linkage cutoff")
+    else:
+        lines.append("%-16s %-10s %-12s %8s  %s" %
+                     ("Type", "Ub chain", "Target", "Dist(A)", "Atoms"))
+        lines.append("-" * 78)
+        for row in linkage_rows:
+            lines.append("%-16s %-10s %-12s %8.2f  %s" %
+                         (row["type"], row["ub_chain"],
+                          "%s:%s.%s" % (row["target_chain"], row["target_residue"], row["target_atom"]),
+                          row["distance"], row["detail"]))
+    return "\n".join(lines)
+
+
+def ppi_ub(spec="", target_chains="", prefix="PPIub", visualize=1,
+           export_dir="", summary_csv="", hbond_cutoff=3.6, salt_cutoff=4.0,
+           hydrophobic_cutoff=4.2, clash_cutoff=2.2, linkage_cutoff=2.4,
+           ub_chains=""):
+    """Analyze ubiquitin-chain interfaces and likely ubiquitination linkages.
+
+    Examples:
+        ppi_ub 5bnb
+        ppi_ub "object=5bnb; ub_chains=D; target_chains=A+B"
+        ppi_ub "object=7s6o; linkage_cutoff=2.8"
+    """
+    options = _parse_key_value_spec(spec, "object")
+    complex_obj = options.get("object", options.get("model", options.get("obj", "")))
+    if not complex_obj:
+        raise ValueError("Please provide an object name, e.g. ppi_ub 5bnb")
+    prefix = options.get("prefix", prefix)
+    export_dir = options.get("export_dir", export_dir)
+    summary_csv = options.get("summary_csv", summary_csv)
+    visualize = options.get("visualize", visualize)
+    hbond_cutoff = float(options.get("hbond_cutoff", hbond_cutoff))
+    salt_cutoff = float(options.get("salt_cutoff", salt_cutoff))
+    hydrophobic_cutoff = float(options.get("hydrophobic_cutoff", hydrophobic_cutoff))
+    clash_cutoff = float(options.get("clash_cutoff", clash_cutoff))
+    linkage_cutoff = float(options.get("linkage_cutoff", linkage_cutoff))
+    ub_chains = options.get("ub_chains", options.get("ub", ub_chains))
+    target_chains = options.get("target_chains", options.get("target", target_chains))
+
+    detected = _ubiquitin_like_chains(complex_obj)
+    detected_chains = [item["chain"] for item in detected]
+    ub_chain_values = _parse_optional_chains(ub_chains) or detected_chains
+    if not ub_chain_values:
+        raise ValueError("No ubiquitin-like chains were detected. Use ub_chains=A+B to specify them manually.")
+
+    all_chains = [c for c in cmd.get_chains(complex_obj) if c]
+    target_values = _parse_optional_chains(target_chains)
+    if not target_values:
+        target_values = [c for c in all_chains if c not in ub_chain_values]
+        for chain in ub_chain_values:
+            for other in ub_chain_values:
+                if other != chain and other not in target_values:
+                    target_values.append(other)
+    if not target_values:
+        raise ValueError("No target chains are available for ubiquitin analysis.")
+
+    if export_dir:
+        export_dir = os.path.expanduser(export_dir)
+        if not os.path.isdir(export_dir):
+            os.makedirs(export_dir)
+
+    pair_rows = []
+    results = {}
+    seen_pairs = set()
+    for ub_chain in ub_chain_values:
+        for target_chain in target_values:
+            if target_chain == ub_chain:
+                continue
+            pair_key = tuple(sorted([ub_chain, target_chain]))
+            if target_chain in ub_chain_values and pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+            pair_prefix = _safe_name("%s%s%s%s" % (prefix, complex_obj, ub_chain, target_chain), "PPIub")
+            pair_export = os.path.join(export_dir, pair_prefix + ".csv") if export_dir else ""
+            result = analyze_pair(
+                complex_obj, ub_chain, target_chain, prefix=pair_prefix,
+                visualize=visualize, export_path=pair_export,
+                hbond_cutoff=hbond_cutoff, salt_cutoff=salt_cutoff,
+                hydrophobic_cutoff=hydrophobic_cutoff, clash_cutoff=clash_cutoff,
+                quiet=1,
+            )
+            row = {
+                "ub_chain": ub_chain,
+                "target_chain": target_chain,
+                "interface_residues": len(result["interface"]["residues"]),
+                "interface_area": result["summary"]["interface_area"],
+                "buried_area": result["summary"]["total_buried_area"],
+                "hbonds": len(result["contacts"]["hbonds"]),
+                "salt_bridges": len(result["contacts"]["salt_bridges"]),
+                "hydrophobic": len(result["contacts"]["hydrophobic"]),
+                "clashes": len(result["contacts"]["clashes"]),
+                "score": result["summary"]["score"],
+                "prefix": result["prefix"],
+            }
+            pair_rows.append(row)
+            results["%s-%s" % (ub_chain, target_chain)] = result
+
+    pair_rows.sort(key=lambda r: (r["ub_chain"], r["target_chain"]))
+    linkage_rows, linkage_contacts = _ubiquitin_linkages(
+        complex_obj, ub_chain_values, target_values, linkage_cutoff)
+    if _as_bool(visualize):
+        ub_sel = _safe_name(prefix + "chains")
+        target_sel = _safe_name(prefix + "targets")
+        cmd.select(ub_sel, "%s and chain %s" % (_model_selection(complex_obj), "+".join(ub_chain_values)))
+        cmd.select(target_sel, "%s and chain %s" % (_model_selection(complex_obj), "+".join(target_values)))
+        cmd.color(COLORS["ubiquitin"], _selref(ub_sel))
+        cmd.color(COLORS["ubiquitin_target"], _selref(target_sel))
+        _distance_object(prefix + "linkages", linkage_contacts, COLORS["ubiquitin_linkage"], 80)
+
+    table = _format_ubiquitin_summary(complex_obj, ub_chain_values, pair_rows, linkage_rows)
+    if summary_csv:
+        with open(os.path.expanduser(summary_csv), "w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["ub_chain", "target_chain", "interface_residues", "interface_area_A2",
+                             "buried_area_A2", "hbonds", "salt_bridges", "hydrophobic",
+                             "clashes", "score", "object_prefix"])
+            for row in pair_rows:
+                writer.writerow([row["ub_chain"], row["target_chain"], row["interface_residues"],
+                                 "%.2f" % row["interface_area"], "%.2f" % row["buried_area"],
+                                 row["hbonds"], row["salt_bridges"], row["hydrophobic"],
+                                 row["clashes"], "%.1f" % row["score"], row["prefix"]])
+            writer.writerow([])
+            writer.writerow(["linkage_type", "ub_chain", "ub_residue", "target_chain",
+                             "target_residue", "target_atom", "distance_A", "detail"])
+            for row in linkage_rows:
+                writer.writerow([row["type"], row["ub_chain"], row["ub_residue"],
+                                 row["target_chain"], row["target_residue"], row["target_atom"],
+                                 "%.2f" % row["distance"], row["detail"]])
+        print("[%s] Ubiquitin summary CSV exported: %s" % (PLUGIN, os.path.expanduser(summary_csv)))
+    print(table)
+    return {"ubiquitin_chains": ub_chain_values, "target_chains": target_values,
+            "summary_rows": pair_rows, "linkage_rows": linkage_rows,
+            "results": results, "table": table}
+
+
 def ppi_score_help():
     text = """
 [Protein Interaction Analyzer] How to compare interface strength
@@ -1687,6 +1941,7 @@ def ppi_panel():
         print("  select my_region, 1brs and chain A and resi 185-205")
         print("  ppi_region my_region")
         print("  ppi_ptm 7mp9")
+        print("  ppi_ub 5bnb")
         return None
     parent = None
     try:
@@ -1705,6 +1960,7 @@ def __init_plugin__(app=None):
     cmd.extend("ppi_batch", ppi_batch)
     cmd.extend("ppi_region", ppi_region)
     cmd.extend("ppi_ptm", ppi_ptm)
+    cmd.extend("ppi_ub", ppi_ub)
     cmd.extend("ppi_score_help", ppi_score_help)
     try:
         app.menuBar.addmenuitem("Plugin", "command", PLUGIN, label=PLUGIN, command=ppi_panel)
@@ -1719,4 +1975,5 @@ cmd.extend("ppi_analyze", ppi_analyze)
 cmd.extend("ppi_batch", ppi_batch)
 cmd.extend("ppi_region", ppi_region)
 cmd.extend("ppi_ptm", ppi_ptm)
+cmd.extend("ppi_ub", ppi_ub)
 cmd.extend("ppi_score_help", ppi_score_help)
